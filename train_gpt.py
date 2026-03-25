@@ -382,17 +382,24 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        # GPTQ-lite: search for optimal clip percentile per weight matrix.
+        # Try 5 candidates and pick the one minimizing reconstruction MSE.
+        best_q, best_s, best_err = None, None, float('inf')
+        for pct in [0.999, 0.9995, 0.9999, 0.99999, 1.0]:
+            if pct < 1.0:
+                clip_abs = torch.quantile(t32.abs(), pct, dim=1)
+            else:
+                clip_abs = t32.abs().amax(dim=1)
+            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+            clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8)
+            recon = q.float() * scale[:, None]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q = q.contiguous()
+                best_s = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+                best_err = err
+        return best_q, best_s
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
