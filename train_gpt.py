@@ -101,6 +101,10 @@ class Hyperparameters:
     # LN scale factor
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
 
+    # Random adapter mode: use frozen random backbones + LoRA adapters
+    use_random_adapters = bool(int(os.environ.get("USE_RANDOM_ADAPTERS", "0")))
+    adapter_rank = int(os.environ.get("ADAPTER_RANK", 32))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -363,7 +367,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,vr_alpha",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,vr_alpha,adapter_scale",
     ).split(",")
     if pattern
 )
@@ -601,6 +605,61 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+# Global seed for reproducible random matrices (embedded in code = 0 bytes in artifact)
+RANDOM_BACKBONE_SEED = 42_000_000
+
+class RandomAdapterLinear(nn.Module):
+    """Frozen random linear map + trainable LoRA adapters.
+
+    The random matrix is reconstructed from a deterministic seed at init time
+    and never stored in the state_dict. Only the small adapter matrices A, B
+    are saved, giving a massive compression advantage.
+
+    Forward: y = frozen_random(x) + scale * B(A(x))
+    """
+    _next_id = 0  # class-level counter for unique seeding per instance
+
+    def __init__(self, in_features: int, out_features: int, rank: int = 32, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+
+        # Assign a unique ID for deterministic seeding
+        self._layer_id = RandomAdapterLinear._next_id
+        RandomAdapterLinear._next_id += 1
+
+        # Frozen random weight — NOT a parameter, NOT in state_dict
+        rng = torch.Generator()
+        rng.manual_seed(RANDOM_BACKBONE_SEED + self._layer_id)
+        # Kaiming uniform init for the random backbone
+        std = (2.0 / in_features) ** 0.5
+        frozen_w = torch.randn(out_features, in_features, generator=rng) * std
+        self.register_buffer("frozen_weight", frozen_w, persistent=False)
+
+        # Trainable LoRA adapters (these ARE saved in state_dict)
+        self.adapter_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / in_features ** 0.5))
+        self.adapter_B = nn.Parameter(torch.zeros(out_features, rank))
+
+        # Learnable scale for adapter contribution
+        self.adapter_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.bias = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Frozen backbone (cast to compute dtype)
+        y = F.linear(x, self.frozen_weight.to(x.dtype))
+        # LoRA adapter: x -> A -> B, scaled
+        adapter_out = F.linear(F.linear(x, self.adapter_A.to(x.dtype)), self.adapter_B.to(x.dtype))
+        y = y + self.adapter_scale.to(x.dtype) * adapter_out
+        if self.bias is not None:
+            y = y + self.bias.to(x.dtype)
+        return y
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -640,6 +699,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def make_linear(in_f: int, out_f: int, bias: bool = False,
+                 use_adapter: bool = False, rank: int = 32) -> nn.Module:
+    """Factory: returns CastedLinear or RandomAdapterLinear."""
+    if use_adapter:
+        return RandomAdapterLinear(in_f, out_f, rank=rank, bias=bias)
+    return CastedLinear(in_f, out_f, bias=bias)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -648,6 +715,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_adapter: bool = False,
+        adapter_rank: int = 32,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -660,11 +729,12 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.c_q = make_linear(dim, dim, use_adapter=use_adapter, rank=adapter_rank)
+        self.c_k = make_linear(dim, kv_dim, use_adapter=use_adapter, rank=adapter_rank)
+        self.c_v = make_linear(dim, kv_dim, use_adapter=use_adapter, rank=adapter_rank)
+        self.proj = make_linear(dim, dim, use_adapter=use_adapter, rank=adapter_rank)
+        if not use_adapter:
+            self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -692,12 +762,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_adapter: bool = False, adapter_rank: int = 32):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = make_linear(dim, hidden, use_adapter=use_adapter, rank=adapter_rank)
+        self.proj = make_linear(hidden, dim, use_adapter=use_adapter, rank=adapter_rank)
+        if not use_adapter:
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
@@ -714,14 +785,17 @@ class Block(nn.Module):
         qk_gain_init: float,
         parallel: bool = False,
         ln_scale_factor: float = 1.0,
+        use_adapter: bool = False,
+        adapter_rank: int = 32,
     ):
         super().__init__()
         self.parallel = parallel
         self.ln_scale_factor = ln_scale_factor
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                         use_adapter=use_adapter, adapter_rank=adapter_rank)
+        self.mlp = MLP(dim, mlp_mult, use_adapter=use_adapter, adapter_rank=adapter_rank)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -758,6 +832,8 @@ class GPT(nn.Module):
         parallel_residual_start: int = 7,
         ln_scale: bool = True,
         recur_layers: str = "",
+        use_adapter: bool = False,
+        adapter_rank: int = 32,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -779,6 +855,7 @@ class GPT(nn.Module):
             self.blocks.append(Block(
                 model_dim, num_heads, num_kv_heads, mlp_mult,
                 rope_base, qk_gain_init, parallel=parallel, ln_scale_factor=lns,
+                use_adapter=use_adapter, adapter_rank=adapter_rank,
             ))
 
         # U-Net skip connections
@@ -1000,6 +1077,8 @@ def main() -> None:
         parallel_residual_start=args.parallel_residual_start,
         ln_scale=args.ln_scale,
         recur_layers=args.recur_layers,
+        use_adapter=args.use_random_adapters,
+        adapter_rank=args.adapter_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
