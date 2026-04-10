@@ -629,13 +629,14 @@ class RandomAdapterLinear(nn.Module):
         self._layer_id = RandomAdapterLinear._next_id
         RandomAdapterLinear._next_id += 1
 
-        # Frozen random weight — NOT a parameter, NOT in state_dict
+        # Frozen random weight as a Parameter with requires_grad=False.
+        # This makes it autograd-safe and moveable with .to(device).
+        # We exclude it from state_dict via _frozen_param_names.
         rng = torch.Generator()
         rng.manual_seed(RANDOM_BACKBONE_SEED + self._layer_id)
-        # Kaiming uniform init for the random backbone
         std = (2.0 / in_features) ** 0.5
         frozen_w = torch.randn(out_features, in_features, generator=rng) * std
-        self.register_buffer("frozen_weight", frozen_w, persistent=False)
+        self.frozen_weight = nn.Parameter(frozen_w, requires_grad=False)
 
         # Trainable LoRA adapters (these ARE saved in state_dict)
         self.adapter_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / in_features ** 0.5))
@@ -650,7 +651,7 @@ class RandomAdapterLinear(nn.Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        # Frozen backbone (cast to compute dtype)
+        # Frozen backbone (no grad, cast to compute dtype)
         y = F.linear(x, self.frozen_weight.to(x.dtype))
         # LoRA adapter: x -> A -> B, scaled
         adapter_out = F.linear(F.linear(x, self.adapter_A.to(x.dtype)), self.adapter_B.to(x.dtype))
@@ -1084,7 +1085,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not args.use_random_adapters)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1225,6 +1226,12 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    # Invalidate any inference-mode cached tensors (e.g. Rotary cos/sin from eval)
+    for module in base_model.modules():
+        if isinstance(module, Rotary):
+            module._cos_cached = None
+            module._sin_cached = None
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     looping_activated = False
@@ -1348,14 +1355,20 @@ def main() -> None:
                 if name in ema_params:
                     p.data.copy_(ema_params[name])
 
+    # Filter out frozen_weight params (reconstructed from seed, not stored)
+    save_state = {k: v for k, v in base_model.state_dict().items() if "frozen_weight" not in k}
+    frozen_count = sum(1 for k in base_model.state_dict() if "frozen_weight" in k)
+    if frozen_count > 0:
+        log0(f"random_adapters:excluded {frozen_count} frozen_weight tensors from state_dict")
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(save_state, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(save_state)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1415,7 +1428,7 @@ def main() -> None:
         quant_raw_disk = zlib.decompress(quant_blob_disk)
 
     quant_state = torch.load(io.BytesIO(quant_raw_disk), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=not args.use_random_adapters)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     eval_stride = args.eval_stride
