@@ -1223,7 +1223,8 @@ def main() -> None:
     ema_params: dict[str, Tensor] = {}
     if args.ema_decay > 0:
         for name, p in base_model.named_parameters():
-            ema_params[name] = p.data.detach().clone()
+            if "frozen_weight" not in name:
+                ema_params[name] = p.data.detach().clone()
 
     # -----------------------------
     # MAIN TRAINING LOOP
