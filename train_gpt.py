@@ -1311,7 +1311,8 @@ def main() -> None:
             decay = args.ema_decay
             with torch.no_grad():
                 for name, p in base_model.named_parameters():
-                    ema_params[name].lerp_(p.data, 1.0 - decay)
+                    if name in ema_params:
+                        ema_params[name].lerp_(p.data, 1.0 - decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
