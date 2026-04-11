@@ -32,11 +32,22 @@ IMAGE = "runpod/parameter-golf:latest"
 GPU_TYPE = "NVIDIA H100 80GB HBM3"
 CLOUD_TYPE = "ALL"  # cheapest option
 
+# Git branch to use
+GIT_BRANCH = os.environ.get("GIT_BRANCH", "random-adapters")
+
 # Env overrides for the training run (tweak these between runs)
 TRAIN_ENV = {
-    # "QK_GAIN_INIT": "5.25",
-    # "MUON_WD": "0.095",
-    # "SEED": "1337",
+    "USE_RANDOM_ADAPTERS": "1",
+    "ADAPTER_RANK": "128",
+    "NUM_LAYERS": "11",
+    "MODEL_DIM": "480",
+    "NUM_HEADS": "8",
+    "NUM_KV_HEADS": "4",
+    "MLP_MULT": "2",
+    "EMA_DECAY": "0",
+    "EVAL_STRIDE": "0",
+    "WARMDOWN_FRAC": "0.5",
+    "TRAIN_BATCH_TOKENS": "786432",
 }
 
 def build_setup_script(train_shards):
@@ -57,7 +68,7 @@ if [ ! -d parameter-golf ]; then
     git clone https://github.com/dljr-github/parameter-golf.git
 fi
 cd parameter-golf
-git fetch origin main && git reset --hard origin/main
+git fetch origin {GIT_BRANCH} && git checkout {GIT_BRANCH} && git reset --hard origin/{GIT_BRANCH}
 
 # Install deps (some may already be in the template)
 pip install -q sentencepiece brotli numpy huggingface-hub 2>/dev/null || true

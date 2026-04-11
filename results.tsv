@@ -1,0 +1,40 @@
+commit	val_bpb	memory_gb	steps	step_avg_ms	status	description
+226d817	2.1582	10.9	196	614	baseline	Unmodified baseline: 9L 512d 8H 4KV 2xMLP vocab1024
+(reverted)	2.1941	11.0	193	622	worse	EMA decay=0.95 (hurts at 200 steps - averaging drags model back)
+3c62d3a	1.5957	10.9	199	605	kept	warmdown=30 + grad_clip=0.3 (was 1200 warmdown crippling LR to 17%)
+50eb6a4	1.5676	10.9	198	608	kept	+ sliding window eval stride=256 (compile forward_logits)
+5eedd8c	1.5384	12.1	213	565	kept	+ SwiGLU MLP (MLP_MULT=1) - faster & better than relu²
+78de989	1.5337	12.1	213	565	kept	+ Muon weight decay 0.04
+66a5351	1.5331	12.1	213	565	kept	+ GPTQ-lite per-row optimal clip search
+d4311b9	1.5315	12.1	213	565	kept	+ warmdown=40 (retuned for SwiGLU step count)
+6eea707	1.4306	12.1	734	163	kept	batch=131k tokens + warmdown=500 (3.4x more steps!)
+8db5039	1.4279	12.1	732	164	kept	+ LR tune (matrix=0.03, scalar=0.03, embed=0.04)
+1c0a0e0	1.4174	20.4	791	152	BEST@2min	+ grad_accum=1 (single fwd/bwd, more efficient)
+(reverted)	1.4190	20.4	766	157	worse@2m	Value Residual (overhead > benefit at 780 steps)
+(reverted)	1.4239	20.4	769	156	worse@2m	Gated Attention (sigmoid halves attn output)
+--- switching to 5-min runs (MAX_WALLCLOCK_SECONDS=300) ---
+1c0a0e0	1.3336	20.4	1968	152	5min-base	5-min baseline (warmdown=1000)
+1e7f431	1.3330	20.4	1932	155	kept	+ Value Residual (layer-0 V blend)
+cd1c831	1.3320	20.4	1737	173	BEST@5min	+ 10 layers (extra capacity pays off at 1700+ steps)
+(reverted)	1.3333	20.4	1680	179	worse	Gated Attention (no benefit even with better init)
+(env)	1.3324	20.4	1715	175	~same	warmdown=1200 (1000 is fine)
+(env)	1.3752	20.4	952	315	worse	MLP_MULT=2 with 10L (too slow)
+(env)	1.3357	20.4	2189	137	worse	batch=98k (too noisy for 10L)
+--- switching to 10-min runs (MAX_WALLCLOCK_SECONDS=600) ---
+cd1c831	1.2867	23.3	3365	178	kept	10-min baseline (10L, warmdown=2000)
+(env)	1.2849	23.3	3061	196	BEST@10min	11L at 10 min
+(env)	1.3090	23.3	2060	291	worse	12L at 10 min (too slow)
+ae01c30	1.2849	23.3	3061	196	BEST@10min	11L (EMA tested, still hurts at 3000 steps)
+2bb62d4	1.3070	25.8	2493	241	worse@10m	+BigramHash(8192)+SmearGate+LNScale (overhead > benefit on 5090)
+(env)	1.3159	25.8	2268	265	worse@10m	+BigramHash(1536)+SmearGate+LNScale (same: overhead too high on 5090)
+(reverted)	1.2887	23.3	2892	207	worse@10m	LN Scale only (even constant mult adds overhead in compiled graph)
+--- Random Adapter experiments (random-adapters branch) ---
+exp_radapt_proof	2.5103	12.1	395	152	PoC	8L/384d/r32: 1.99 pre-quant, 1.94MB artifact (concept works!)
+exp_radapt_big	OOM	-	-	-	crash	16L/512d/r128: 43.5M params OOM on 32GB 5090
+exp_radapt_med	-	-	10	12500	too_slow	12L/512d/r64: 12.5s/step uncompiled, impractical
+exp_radapt_r128	2.3424	25.3	406	296	quant_gap	8L/384d/r128: 1.678 pre-quant, +0.66 gap (EMA bug)
+exp_radapt_final	1.6807	25.3	412	292	kept	8L/384d/r128 no-EMA: gap -0.001! 6.14MB artifact
+exp_radapt_compile	1.5629	25.3	728	165	kept	8L/384d/r128 COMPILED! 2x speedup, 77% more steps
+exp_radapt_ortho	1.6650	25.3	716	168	worse	ortho init + ReLU adapter (too uniform + dead neurons)
+exp_radapt_ortho_lin	1.6404	25.3	725	166	worse	ortho init + linear adapter (still worse than Gaussian)
+exp_radapt_r256	1.5445	25.3	665	180	BEST	8L/384d/r256 Gaussian+linear (more capacity, 8MB artifact)

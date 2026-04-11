@@ -1,0 +1,40 @@
+logs/140e23eb-c1ec-4ae1-a0e6-405a2481fc14.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_8192_bpe.model
+train_loader:dataset:fineweb10B_sp8192 train_shards:10
+val_loader:shards pattern=./data/datasets/fineweb10B_sp8192/fineweb_val_*.bin tokens:40540160
+model_params:20007012
+world_size:1 grad_accum_steps:6
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 matrix_lr:0.022 scalar_lr:0.02
+train_batch_tokens:786432 train_seq_len:1024 iterations:20000 warmup_steps:5 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/5
+warmup_step:2/5
+warmup_step:3/5
+warmup_step:4/5
+warmup_step:5/5
+step:0/20000 val_loss:9.0067 val_bpb:3.4868 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:9.0067 train_time:819ms step_avg:819.09ms
+step:2/20000 train_loss:11.5989 train_time:1582ms step_avg:790.91ms
+step:3/20000 train_loss:10.7284 train_time:2346ms step_avg:782.15ms
+step:4/20000 train_loss:9.5444 train_time:3112ms step_avg:778.09ms
+step:5/20000 train_loss:8.5612 train_time:3876ms step_avg:775.30ms
+step:6/20000 train_loss:7.7799 train_time:4642ms step_avg:773.71ms
+step:7/20000 train_loss:7.3141 train_time:5408ms step_avg:772.63ms
+step:8/20000 train_loss:7.0453 train_time:6177ms step_avg:772.08ms
+step:9/20000 train_loss:6.8628 train_time:6946ms step_avg:771.74ms
+step:10/20000 train_loss:6.8745 train_time:7715ms step_avg:771.54ms
+step:200/20000 train_loss:3.8465 train_time:153738ms step_avg:768.69ms
+step:400/20000 train_loss:3.5944 train_time:306769ms step_avg:766.92ms
+step:600/20000 train_loss:3.3950 train_time:459726ms step_avg:766.21ms
+step:784/20000 val_loss:3.2977 val_bpb:1.2766 train_time:600420ms step_avg:765.84ms
+stopping_early: wallclock_cap train_time:600420ms step:784/20000
+peak memory allocated: 30569 MiB reserved: 31772 MiB
+Serialized model: 65464913 bytes
+Code size: 63944 bytes
+Serialized model int8+brotli: 15727839 bytes (payload:23515792 raw_torch:23584385 payload_ratio:2.78x)
+Total submission size int8+brotli: 15791783 bytes
+final_eval_mode:standard
+final_int8_zlib_roundtrip val_loss:3.3029 val_bpb:1.2787 eval_time:11339ms
+final_int8_zlib_roundtrip_exact val_loss:3.30289170 val_bpb:1.27865230
