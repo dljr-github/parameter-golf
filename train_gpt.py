@@ -629,17 +629,14 @@ class RandomAdapterLinear(nn.Module):
         self._layer_id = RandomAdapterLinear._next_id
         RandomAdapterLinear._next_id += 1
 
-        # Frozen random weight as a non-persistent buffer.
-        # Buffers: move with .to(device), NOT in state_dict, don't confuse
-        # torch.compile's gradient tracking. Safe now that eval uses
-        # torch.no_grad() instead of torch.inference_mode().
+        # Frozen random weight as a non-persistent buffer (Gaussian Kaiming init).
         rng = torch.Generator()
         rng.manual_seed(RANDOM_BACKBONE_SEED + self._layer_id)
         std = (2.0 / in_features) ** 0.5
         frozen_w = torch.randn(out_features, in_features, generator=rng) * std
         self.register_buffer("frozen_weight", frozen_w, persistent=False)
 
-        # Trainable LoRA adapters (these ARE saved in state_dict)
+        # Trainable LoRA adapters with nonlinearity (small MLP, not just linear)
         self.adapter_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / in_features ** 0.5))
         self.adapter_B = nn.Parameter(torch.zeros(out_features, rank))
 
@@ -652,7 +649,7 @@ class RandomAdapterLinear(nn.Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        # Frozen backbone (no grad, cast to compute dtype)
+        # Frozen backbone (orthogonal, no grad)
         y = F.linear(x, self.frozen_weight.to(x.dtype))
         # LoRA adapter: x -> A -> B, scaled
         adapter_out = F.linear(F.linear(x, self.adapter_A.to(x.dtype)), self.adapter_B.to(x.dtype))
