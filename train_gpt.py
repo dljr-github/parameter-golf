@@ -731,9 +731,9 @@ class CausalSelfAttention(nn.Module):
         self.c_q = make_linear(dim, dim, use_adapter=use_adapter, rank=adapter_rank)
         self.c_k = make_linear(dim, kv_dim, use_adapter=use_adapter, rank=adapter_rank)
         self.c_v = make_linear(dim, kv_dim, use_adapter=use_adapter, rank=adapter_rank)
-        self.proj = make_linear(dim, dim, use_adapter=use_adapter, rank=adapter_rank)
-        if not use_adapter:
-            self.proj._zero_init = True
+        # Output projection always fully trainable (critical for representation)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
