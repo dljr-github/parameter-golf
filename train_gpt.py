@@ -629,14 +629,15 @@ class RandomAdapterLinear(nn.Module):
         self._layer_id = RandomAdapterLinear._next_id
         RandomAdapterLinear._next_id += 1
 
-        # Frozen random weight as a Parameter with requires_grad=False.
-        # This makes it autograd-safe and moveable with .to(device).
-        # We exclude it from state_dict via _frozen_param_names.
+        # Frozen random weight as a non-persistent buffer.
+        # Buffers: move with .to(device), NOT in state_dict, don't confuse
+        # torch.compile's gradient tracking. Safe now that eval uses
+        # torch.no_grad() instead of torch.inference_mode().
         rng = torch.Generator()
         rng.manual_seed(RANDOM_BACKBONE_SEED + self._layer_id)
         std = (2.0 / in_features) ** 0.5
         frozen_w = torch.randn(out_features, in_features, generator=rng) * std
-        self.frozen_weight = nn.Parameter(frozen_w, requires_grad=False)
+        self.register_buffer("frozen_weight", frozen_w, persistent=False)
 
         # Trainable LoRA adapters (these ARE saved in state_dict)
         self.adapter_A = nn.Parameter(torch.randn(rank, in_features) * (1.0 / in_features ** 0.5))
@@ -1085,10 +1086,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if args.use_random_adapters:
-        compiled_model = base_model  # torch.compile hangs with frozen Parameters
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1223,8 +1221,7 @@ def main() -> None:
     ema_params: dict[str, Tensor] = {}
     if args.ema_decay > 0:
         for name, p in base_model.named_parameters():
-            if "frozen_weight" not in name:
-                ema_params[name] = p.data.detach().clone()
+            ema_params[name] = p.data.detach().clone()
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1306,13 +1303,12 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA update
+        # EMA update (named_parameters excludes buffers like frozen_weight)
         if ema_params and args.ema_decay > 0:
             decay = args.ema_decay
             with torch.no_grad():
                 for name, p in base_model.named_parameters():
-                    if name in ema_params:
-                        ema_params[name].lerp_(p.data, 1.0 - decay)
+                    ema_params[name].lerp_(p.data, 1.0 - decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
