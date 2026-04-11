@@ -794,7 +794,9 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          use_adapter=use_adapter, adapter_rank=adapter_rank)
-        self.mlp = MLP(dim, mlp_mult, use_adapter=use_adapter, adapter_rank=adapter_rank)
+        # MLP is always fully trainable — it's the transformer's workhorse.
+        # Random adapters only on attention projections (the novel part).
+        self.mlp = MLP(dim, mlp_mult, use_adapter=False, adapter_rank=adapter_rank)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
